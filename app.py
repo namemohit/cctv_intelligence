@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 import cv2
 import threading
@@ -8,9 +9,22 @@ import time
 import json
 import asyncio
 import os
+import sys
 import socket
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict
+
+# Path handling for PyInstaller standalone mode
+def get_base_path():
+    if getattr(sys, 'frozen', False):
+        return Path(sys._MEIPASS)
+    return Path(os.path.dirname(os.path.abspath(__file__)))
+
+BASE_PATH = get_base_path()
+DIST_PATH = BASE_PATH / "frontend" / "dist"
+
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|analyzeduration;50000000|probesize;50000000"
 from pydantic import BaseModel
 
 # Import the existing YOLO detector
@@ -21,14 +35,14 @@ app = FastAPI(title="DVR YOLO Integration API")
 # Setup CORS for the frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Global variables to hold the current video source and stats
-current_video_source = "rtsp://admin:Puran234@192.168.1.34:554/Streaming/Channels/102"
+current_video_source = None
 latest_stats = {
     "person_count": 0,
     "last_update": time.time(),
@@ -118,57 +132,44 @@ def generate_frames():
 
     # Initialize YOLO detector (nano model for speed)
     print("Initializing YOLO detector...")
-    detector = YOLODVRDetector("yolov8n.pt", conf_threshold=0.5)
+    detector = YOLODVRDetector(model_name=str(BASE_PATH / "yolov8n.pt"))
     print("Detector initialized.")
 
     ffmpeg_proc = None
-    frame_width = 0
-    frame_height = 0
     last_source = None
-
-    def test_tcp_connection(ip, port, timeout=3):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((ip, int(port)))
-            sock.close()
-            return result == 0
-        except Exception:
-            return False
-
-
-    # Fixed output dimensions — FFmpeg scales any codec/resolution to this
     FRAME_W, FRAME_H = 1280, 720
+    frame_size = FRAME_W * FRAME_H * 3
 
-    def open_ffmpeg_pipe(url, width=FRAME_W, height=FRAME_H):
-        """Open an FFmpeg subprocess that outputs raw BGR24 frames at fixed WxH.
-        Uses ultra-compatible flags for non-standard DVR streams."""
+    def open_ffmpeg_pipe(url):
+        """Open an FFmpeg subprocess that outputs raw BGR24 frames at fixed WxH."""
+        # Check for ffmpeg in BASE_PATH (bundled) or local dev path
+        bundled_ffmpeg = BASE_PATH / "ffmpeg" / "bin" / "ffmpeg.exe"
+        if bundled_ffmpeg.exists():
+            ffmpeg_path = str(bundled_ffmpeg)
+        else:
+            ffmpeg_path = "ffmpeg"
+            
         cmd = [
-            "ffmpeg",
+            ffmpeg_path,
+            "-hide_banner",
             "-loglevel", "error",
-            # RTSP transport and timeout (5s in microseconds)
             "-rtsp_transport", "tcp",
             "-timeout", "5000000",
-            # Give it more time to find headers
-            "-analyzeduration", "20000000",
-            "-probesize", "20000000",
-            "-fflags", "+genpts+igndts",
             "-i", url,
-            "-vf", f"scale={width}:{height}",
+            "-vf", f"scale={FRAME_W}:{FRAME_H}",
             "-pix_fmt", "bgr24",
             "-vcodec", "rawvideo",
-            "-an",
-            "-sn",
+            "-an", "-sn",
             "-f", "rawvideo",
             "pipe:1"
         ]
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                bufsize=width * height * 3 * 10)
-
+        import subprocess
+        # Back to DEVNULL to keep things clean
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_size * 5)
     import numpy as np
+
     while True:
         try:
-            # If no source provided yet, wait
             if current_video_source is None:
                 if latest_stats["status"] != "waiting_for_source":
                     print("Background thread: waiting for source...")
@@ -176,60 +177,40 @@ def generate_frames():
                 time.sleep(1)
                 continue
             
-            print(f"Background thread source check: {current_video_source}")
-
-            # If source changed, kill existing ffmpeg process
             if current_video_source != last_source:
                 if ffmpeg_proc:
                     ffmpeg_proc.kill()
                     ffmpeg_proc = None
                 last_source = current_video_source
+                print(f"Background thread source changed to: {current_video_source}")
 
-            # Open FFmpeg pipe if needed
             if ffmpeg_proc is None or ffmpeg_proc.poll() is not None:
                 url = current_video_source
-                print(f"Connecting to source via FFmpeg: {url}")
+                print(f"Connecting via FFmpeg pipe: {url}")
                 latest_stats["status"] = "connecting"
-                latest_stats["error_message"] = "Initializing connection..."
-
-                # Test TCP port first if RTSP
-                if url.startswith("rtsp://"):
-                    try:
-                        import urllib.parse
-                        parsed = urllib.parse.urlparse(url)
-                        ip_addr = parsed.hostname
-                        port_num = parsed.port if parsed.port else 554
-                        latest_stats["error_message"] = f"Testing TCP to {ip_addr}:{port_num}..."
-                        if not test_tcp_connection(ip_addr, port_num):
-                            latest_stats["status"] = "error"
-                            latest_stats["error_message"] = f"Network Error: Cannot reach {ip_addr}:{port_num}"
-                            time.sleep(5)
-                            continue
-                    except Exception:
-                        pass
-
-                latest_stats["error_message"] = "Starting FFmpeg decoder..."
-                frame_width, frame_height = FRAME_W, FRAME_H
+                latest_stats["error_message"] = "Starting FFmpeg..."
                 ffmpeg_proc = open_ffmpeg_pipe(url)
                 latest_stats["status"] = "connected"
                 latest_stats["error_message"] = None
 
-            # Read one raw BGR frame from FFmpeg stdout
-            frame_size = FRAME_W * FRAME_H * 3
             t_start = time.time()
+            # Read frame
             raw = ffmpeg_proc.stdout.read(frame_size)
-
-            if len(raw) < frame_size:
-                err_out = ffmpeg_proc.stderr.read().decode('utf-8', errors='ignore')
-                print(f"FFmpeg pipe ended or frame incomplete. Log:\n{err_out}")
-                latest_stats["error_message"] = f"FFmpeg error: {err_out[:100]}"
-                ffmpeg_proc.kill()
+            
+            if not raw or len(raw) < frame_size:
+                print(f"FFmpeg stream ended or frame incomplete ({len(raw) if raw else 0}/{frame_size}).")
+                latest_stats["error_message"] = "Stream ended or reconnecting"
+                if ffmpeg_proc:
+                    ffmpeg_proc.terminate()
+                    try:
+                        ffmpeg_proc.wait(timeout=2)
+                    except:
+                        ffmpeg_proc.kill()
                 ffmpeg_proc = None
                 time.sleep(1)
                 continue
-
-            # import numpy as np  # moved up
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_height, frame_width, 3))
+                
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((FRAME_H, FRAME_W, 3)).copy()
             
             # DIAGNOSTIC OVERLAY
             cv2.putText(frame, "RECV OK", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -267,6 +248,11 @@ def generate_frames():
             if ret_enc:
                 with frame_lock:
                     latest_frame = buffer.tobytes()
+            
+            # Throttle loop to ~30 FPS max (0.033s) to save CPU
+            elapsed = time.time() - t_start
+            if elapsed < 0.033:
+                time.sleep(0.033 - elapsed)
 
         except Exception as e:
             print(f"Error in frame generation: {e}")
@@ -306,5 +292,13 @@ async def video_feed(request: Request):
     """Endpoint to stream the processed video"""
     return StreamingResponse(video_stream(request), media_type="multipart/x-mixed-replace; boundary=frame")
 
+# Serve the pre-built React frontend
+if DIST_PATH.exists():
+    app.mount("/", StaticFiles(directory=str(DIST_PATH), html=True), name="static")
+else:
+    @app.get("/")
+    async def index():
+        return {"message": "Development mode: Frontend not found at " + str(DIST_PATH)}
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

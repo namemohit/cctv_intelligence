@@ -41,7 +41,7 @@ function App() {
     
     const fetchStats = async () => {
       try {
-        const res = await fetch('http://localhost:8000/api/stats');
+        const res = await fetch('/api/stats');
         if (res.ok) {
           const data = await res.json();
           setStats(data);
@@ -111,7 +111,7 @@ function App() {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000);
       
-      const res = await fetch('http://localhost:8000/api/set_source', {
+      const res = await fetch('/api/set_source', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -135,7 +135,7 @@ function App() {
   };
 
   const useSampleVideo = async () => {
-    const sampleUrl = "/Users/mohit/Desktop/name.mohit/dvr_yolo_integration_codebase/ForBiggerFun.mp4";
+    const sampleUrl = "sample_video.mp4";
     setRtspUrl(sampleUrl);
     setInputType('raw');
     
